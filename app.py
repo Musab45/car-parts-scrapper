@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -316,13 +316,14 @@ def scrape_product_details(product_url: str, barcode: str) -> Dict[str, Any]:
                             if "." in url_filename:
                                 ext = "." + url_filename.split(".")[-1]
                         
-                        filename = f"{images_folder}/image_{idx}{ext}"
+                        # Use downloaded_count + 1 for sequential naming
+                        filename = f"{images_folder}/image_{downloaded_count + 1}{ext}"
                         with open(filename, "wb") as f:
                             f.write(response.content)
                         downloaded_count += 1
-                        logger.info(f"📥 Downloaded image {idx}: {filename}")
+                        logger.info(f"📥 Downloaded image {downloaded_count}: {filename}")
                 except Exception as e:
-                    logger.warning(f"⚠️  Failed to download image {idx}: {str(e)[:80]}")
+                    logger.warning(f"⚠️  Failed to download image from URL {idx}: {str(e)[:80]}")
             
             product_data["images_downloaded"] = downloaded_count
             logger.info(f"✅ Downloaded {downloaded_count}/{len(image_urls)} images to {images_folder}")
@@ -659,6 +660,23 @@ async def health_check():
         "status": "healthy",
         "browser_active": driver is not None
     }
+
+
+@app.get("/images/{barcode}/{image_number}")
+async def get_image(barcode: str, image_number: int):
+    """Serve images for a specific barcode"""
+    # Sanitize barcode for folder name (same as scraper logic)
+    sanitized_barcode = barcode.replace(" ", "_").replace("/", "-").replace("\\", "-")
+    image_folder = f"images/{sanitized_barcode}"
+    
+    # Try common image extensions
+    for ext in ['.jpg', '.jpeg', '.png', '.webp']:
+        image_path = os.path.join(image_folder, f"image_{image_number}{ext}")
+        if os.path.exists(image_path):
+            return FileResponse(image_path)
+    
+    # If no image found, return 404
+    raise HTTPException(status_code=404, detail="Image not found")
 
 
 @app.post("/scrape", response_model=ProductResponse)
