@@ -91,7 +91,7 @@ def warmup_autodoc():
     global autodoc_cookie_handled
     if not autodoc_cookie_handled:
         logger.info("🌐 Warming up: navigating to autodoc.parts homepage...")
-        driver.get("https://www.autodoc.parts/")
+        driver.get("https://www.autodoc.co.uk/")
         _wait_for_cloudflare(max_wait=60)
         handle_cookies()
         logger.info("✅ Browser warmed up for autodoc")
@@ -730,7 +730,7 @@ def scrape_barcode(request: BarcodeRequest):
             warmup_autodoc()
             
             # Navigate to search page
-            url = f"https://www.autodoc.parts/search?keyword={barcode}"
+            url = f"https://www.autodoc.co.uk/spares-search?keyword={barcode}"
             logger.info(f"🌐 Navigating to: {url}")
             driver.get(url)
             
