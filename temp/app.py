@@ -16,7 +16,6 @@ import requests
 import atexit
 import signal
 from typing import Optional, Dict, Any
-from captcha_solver import dynamic_captcha
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +59,7 @@ class BrowserInstance:
     def start(self):
         """Spin up Chrome for this instance."""
         logger.info(f"🚀 [inst-{self.id}] Starting Chrome...")
+        # SeleniumBase Driver with built-in stealth features
         self.driver = Driver(uc=True, headless=False)
         self.wait   = WebDriverWait(self.driver, 15)
         self._alive = True
@@ -96,8 +96,7 @@ class BrowserInstance:
         if not self._alive or self.driver is None:
             return False
         try:
-            # Check if we can execute a simple command
-            self.driver.execute_script("return true;")
+            _ = self.driver.title
             return True
         except Exception:
             self._alive = False
@@ -201,19 +200,8 @@ class BrowserPool:
 
             with self._lock:
                 pool_size = len(self._instances)
-                for candidate in self._instances[:]:  # Create a copy to avoid modification during iteration
+                for candidate in self._instances:
                     if candidate.lock.acquire(blocking=False):
-                        # Double-check health after acquiring lock
-                        if not candidate.is_alive():
-                            candidate.lock.release()
-                            # Remove dead instance from pool
-                            try:
-                                self._instances.remove(candidate)
-                                logger.warning(f"🗑️  [inst-{candidate.id}] Removed dead instance from pool")
-                                candidate.quit()
-                            except (ValueError, RuntimeError):
-                                pass
-                            continue
                         inst = candidate
                         break
 
@@ -232,9 +220,8 @@ class BrowserPool:
             # ── Outside pool lock ───────────────────────────────────
             if inst is not None:
                 # Health check / revive happens outside the pool lock
-                # so other threads aren't blocked while Chrome restarts.
+                # so other threads aren’t blocked while Chrome restarts.
                 if not inst.is_alive():
-                    logger.warning(f"⚠️  [inst-{inst.id}] Instance died, reviving...")
                     inst.revive()
                     inst.autodoc_cookie_handled = False
                     inst.realoem_cookie_handled = False
@@ -242,7 +229,6 @@ class BrowserPool:
                 logger.info(f"🟢 [inst-{inst.id}] Acquired from pool ({pool_size} total)")
                 return inst
 
-            # If no instance available, wait a bit and try again
             time.sleep(0.5)
 
         raise RuntimeError("BrowserPool: no instance available within timeout")
@@ -269,50 +255,34 @@ class BrowserPool:
             logger.info(f"✅ [inst-{inst.id}] Temp instance ready")
         except Exception as e:
             logger.error(f"❌ [inst-{inst.id}] Chrome failed to start: {e}")
-            # Remove from pool safely
             with self._lock:
-                try:
+                if inst in self._instances:
                     self._instances.remove(inst)
-                except ValueError:
-                    pass  # already removed
-            # Clean up the instance
-            try:
-                inst.quit()
-            except Exception as cleanup_e:
-                logger.warning(f"⚠️  [inst-{inst.id}] Cleanup failed during startup error: {cleanup_e}")
+            inst.quit()
         finally:
-            # Always release lock to prevent deadlock
+            # Always release so acquire() isn’t left spinning forever
             try:
                 inst.lock.release()
             except RuntimeError:
-                logger.warning(f"⚠️  [inst-{inst.id}] Lock was already released during startup")
+                pass
 
     def _idle_reaper(self):
         """Background thread: kill temp instances idle for > IDLE_KILL_AFTER seconds."""
-        while not self._stopped:
-            try:
-                time.sleep(IDLE_CHECK_EVERY)
-                if self._stopped:
-                    break
-                now = time.time()
-                with self._lock:
-                    to_kill = [
-                        inst for inst in self._instances
-                        if not inst.permanent
-                        and not inst.lock.locked()
-                        and (now - inst.last_used) > IDLE_KILL_AFTER
-                    ]
-                    for inst in to_kill:
-                        self._instances.remove(inst)
+        while True:
+            time.sleep(IDLE_CHECK_EVERY)
+            now = time.time()
+            with self._lock:
+                to_kill = [
+                    inst for inst in self._instances
+                    if not inst.permanent
+                    and not inst.lock.locked()
+                    and (now - inst.last_used) > IDLE_KILL_AFTER
+                ]
                 for inst in to_kill:
-                    try:
-                        logger.info(f"🗑️  [inst-{inst.id}] Idle reaper killing temp instance")
-                        inst.quit()
-                    except Exception as e:
-                        logger.warning(f"⚠️  [inst-{inst.id}] Error during idle reaper cleanup: {e}")
-            except Exception as e:
-                logger.error(f"❌ Idle reaper thread error: {e}")
-                # Continue running despite errors
+                    self._instances.remove(inst)
+            for inst in to_kill:
+                logger.info(f"🗑️  [inst-{inst.id}] Idle reaper killing temp instance")
+                inst.quit()
 
     def status(self) -> dict:
         with self._lock:
@@ -332,12 +302,7 @@ pool = BrowserPool()
 def _emergency_shutdown(signum=None, frame=None):
     """Called on SIGTERM (uvicorn reload/stop) or process exit as a safety net."""
     logger.info(f"🚨 Emergency shutdown triggered (signal={signum}) — killing all browsers...")
-    try:
-        pool.shutdown()
-    except Exception as e:
-        logger.error(f"❌ Error during emergency shutdown: {e}")
-        # Force kill any remaining processes
-        _kill_orphaned_chromedrivers()
+    pool.shutdown()
 
 # Safety net: catches uvicorn --reload kills and normal process exits
 atexit.register(_emergency_shutdown)
@@ -377,9 +342,6 @@ def _kill_orphaned_chromedrivers():
 
 def _wait_for_cloudflare(inst: BrowserInstance, max_wait: int = 60) -> bool:
     """Wait for Cloudflare challenge to complete on this instance."""
-    current_url = inst.driver.current_url
-    site = "autodoc" if "autodoc" in current_url else "realoem" if "realoem" in current_url else "unknown"
-    
     start = time.time()
     while time.time() - start < max_wait:
         try:
@@ -389,29 +351,12 @@ def _wait_for_cloudflare(inst: BrowserInstance, max_wait: int = 60) -> bool:
             continue
         if "Just a moment" in title or "Checking your browser" in title:
             elapsed = int(time.time() - start)
-            logger.warning(f"⚠️  [inst-{inst.id}] [{site}] Cloudflare active... ({elapsed}s)")
+            logger.warning(f"⚠️  [inst-{inst.id}] Cloudflare active... ({elapsed}s)")
             time.sleep(3)
-            continue
-
-        # Check for Turnstile captcha
-        try:
-            captcha_div = inst.driver.find_element(By.ID, "CZUq4")
-            logger.info(f"🔒 [inst-{inst.id}] [{site}] Cloudflare Turnstile detected, attempting to solve...")
-            if solve_cloudflare_captcha(inst):
-                logger.info(f"✅ [inst-{inst.id}] [{site}] Turnstile captcha solved successfully")
-                time.sleep(2)  # Brief wait before re-checking
-                continue
-            else:
-                logger.error(f"❌ [inst-{inst.id}] [{site}] Failed to solve Turnstile captcha")
-                return False
-        except Exception:
-            # No captcha found, proceed
-            pass
-
-        # If no blocking title and no captcha, assume clear
-        logger.info(f"✅ [inst-{inst.id}] [{site}] Cloudflare challenge passed")
-        return True
-    logger.error(f"❌ [inst-{inst.id}] [{site}] Cloudflare timed out after {max_wait}s")
+        else:
+            logger.info(f"✅ [inst-{inst.id}] Cloudflare passed")
+            return True
+    logger.error(f"❌ [inst-{inst.id}] Cloudflare timed out")
     return False
 
 
@@ -434,60 +379,11 @@ def _handle_cookies(inst: BrowserInstance):
         inst.autodoc_cookie_handled = True  # Don't retry endlessly
 
 
-def extract_sitekey_from_page_source(page_source: str) -> Optional[str]:
-    """Extract the sitekey from Cloudflare Turnstile in page source."""
-    import re
-    # Look for data-sitekey in the Turnstile div
-    match = re.search(r'data-sitekey=["\']([^"\']+)["\']', page_source)
-    if match:
-        return match.group(1)
-    # Fallback: look for the sitekey in iframe src
-    match = re.search(r'challenges\.cloudflare\.com.*?(0x[0-9A-Fa-f]+)', page_source)
-    if match:
-        return match.group(1)
-    return None
-
-
-def solve_cloudflare_captcha(inst: BrowserInstance) -> bool:
-    """Detect and solve Cloudflare Turnstile captcha."""
-    try:
-        current_url = inst.driver.current_url
-        site = "autodoc" if "autodoc" in current_url else "realoem" if "realoem" in current_url else "unknown"
-        
-        # Get page source and extract sitekey
-        page_source = inst.driver.page_source
-        sitekey = extract_sitekey_from_page_source(page_source)
-        if not sitekey:
-            logger.warning(f"⚠️ [inst-{inst.id}] [{site}] Could not extract sitekey from page source")
-            return False
-
-        logger.info(f"🔒 [inst-{inst.id}] [{site}] Solving Turnstile captcha (sitekey: {sitekey})")
-
-        token = dynamic_captcha(sitekey, current_url)
-        if not token:
-            logger.error(f"❌ [inst-{inst.id}] [{site}] Failed to get captcha token from CapSolver")
-            return False
-
-        # Set the token in the hidden input
-        response_input = inst.driver.find_element(By.ID, 'cf-chl-widget-izxbe_response')
-        inst.driver.execute_script("arguments[0].value = arguments[1];", response_input, token)
-        # Dispatch change event to trigger validation
-        inst.driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", response_input)
-
-        logger.info(f"✅ [inst-{inst.id}] [{site}] Captcha token injected, waiting for page validation...")
-        time.sleep(3)  # Wait for the page to process the token
-        return True
-    except Exception as e:
-        current_url = inst.driver.current_url
-        site = "autodoc" if "autodoc" in current_url else "realoem" if "realoem" in current_url else "unknown"
-        logger.error(f"❌ [inst-{inst.id}] [{site}] Error solving captcha: {str(e)}")
-        return False
-
-
 @asynccontextmanager
 async def lifespan(app):
     """Start the browser pool on startup, shut it all down on exit."""
-    logger.info("🚀 Server starting up...")
+    logger.info("🚀 Server starting up — initialising BrowserPool...")
+    pool.start()
     yield
     logger.info("🛑 Server shutting down — closing all browser instances...")
     pool.shutdown()
@@ -499,13 +395,6 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
-
-# Start browser pool in background after server is ready
-def start_pool_thread():
-    logger.info("🚀 Initialising BrowserPool in background...")
-    pool.start()
-
-threading.Thread(target=start_pool_thread, daemon=True).start()
 
 
 class BarcodeRequest(BaseModel):
@@ -545,7 +434,6 @@ class AutodocData(BaseModel):
 
 class RealOEMProduct(BaseModel):
     part_number: Optional[str] = None
-    oe_number: Optional[str] = None
     description: Optional[str] = None
 
 class RealOEMPricing(BaseModel):
@@ -557,8 +445,8 @@ class RealOEMDetails(BaseModel):
     weight: Optional[str] = None
 
 class RealOEMCompatibility(BaseModel):
-    vehicle_series: list[str] = []
-    engine_codes: list[str] = []
+    vehicle_count: int = 0
+    first_vehicle_tags: Optional[str] = None
 
 class RealOEMData(BaseModel):
     product: RealOEMProduct = RealOEMProduct()
@@ -617,19 +505,12 @@ def get_first_product_link(inst: BrowserInstance, barcode: str) -> Optional[str]
         return None
 
 
-def scrape_product_details(inst: BrowserInstance, product_url: str, barcode: str, timed_out: threading.Event = None) -> Dict[str, Any]:
+def scrape_product_details(inst: BrowserInstance, product_url: str, barcode: str) -> Dict[str, Any]:
     """Scrape product details from product page and download images"""
-    if timed_out and timed_out.is_set():
-        return {"error": "Scrape timed out"}
-    
     logger.info(f"📄 [inst-{inst.id}] Loading product page: {product_url}")
     inst.driver.get(product_url)
-    _wait_for_cloudflare(inst)
     time.sleep(3)
     logger.info(f"✅ [inst-{inst.id}] Product page loaded")
-    
-    if timed_out and timed_out.is_set():
-        return {"error": "Scrape timed out"}
     
     # Create sanitized barcode for folder name (matches notebook logic)
     sanitized_barcode = barcode.replace(" ", "_").replace("/", "-").replace("\\", "-")
@@ -659,21 +540,7 @@ def scrape_product_details(inst: BrowserInstance, product_url: str, barcode: str
         try:
             logger.info(f"📝 [inst-{inst.id}] Extracting product name...")
             h1_element = inst.driver.find_element(By.CSS_SELECTOR, "h1.product-block__title")
-            full_name = h1_element.text.strip()
-            # Omit text before the second space to get only the description
-            space_count = 0
-            index = 0
-            for i, char in enumerate(full_name):
-                if char == ' ':
-                    space_count += 1
-                    if space_count == 2:
-                        index = i
-                        break
-            if space_count >= 2:
-                product_data["product"]["name"] = full_name[index + 1:].strip()
-            else:
-                # Fallback: Remove the barcode if present
-                product_data["product"]["name"] = full_name.split(barcode)[-1].strip()
+            product_data["product"]["name"] = h1_element.text.strip()
             logger.info(f"✅ [inst-{inst.id}] Product name: {product_data['product']['name'][:50]}")
         except Exception as e:
             logger.warning(f"⚠️  [inst-{inst.id}] Could not extract product name: {str(e)[:50]}")
@@ -781,11 +648,26 @@ def scrape_product_details(inst: BrowserInstance, product_url: str, barcode: str
             product_data["oe_numbers"] = []
 
         # Download product images
-        if timed_out and timed_out.is_set():
-            logger.warning(f"⚠️  [inst-{inst.id}] Timeout during scraping, skipping image download")
-        else:
-            os.makedirs(images_folder, exist_ok=True)
-            
+        os.makedirs(images_folder, exist_ok=True)
+        try:
+            logger.info(f"🖼️  [inst-{inst.id}] Extracting product images...")
+            IMAGE_SELECTORS = [
+                ".product-gallery__image-list-item img",
+                ".product-gallery__image-wrap img",
+                ".product-gallery img",
+                "img[data-srcset*='cdn.autodoc']",
+                "img[srcset*='cdn.autodoc']",
+            ]
+            img_elems = []
+            for selector in IMAGE_SELECTORS:
+                found = inst.driver.find_elements(By.CSS_SELECTOR, selector)
+                if found:
+                    img_elems = found
+                    logger.info(f"🖼️  [inst-{inst.id}] Found {len(img_elems)} image(s) via: {selector}")
+                    break
+            if not img_elems:
+                logger.warning(f"⚠️  [inst-{inst.id}] No product images found")
+
             def _best_url_from_srcset(srcset_str: str) -> Optional[str]:
                 """Pick the highest-resolution URL from a srcset string."""
                 if not srcset_str:
@@ -798,68 +680,49 @@ def scrape_product_details(inst: BrowserInstance, product_url: str, barcode: str
                     if tokens:
                         return tokens[0]  # URL is always first token
                 return None
-            
-            try:
-                logger.info(f"🖼️  [inst-{inst.id}] Extracting product images...")
-                IMAGE_SELECTORS = [
-                    ".product-gallery__image-list-item img",
-                    ".product-gallery__image-wrap img",
-                    ".product-gallery img",
-                    "img[data-srcset*='cdn.autodoc']",
-                    "img[srcset*='cdn.autodoc']",
-                ]
-                img_elems = []
-                for selector in IMAGE_SELECTORS:
-                    found = inst.driver.find_elements(By.CSS_SELECTOR, selector)
-                    if found:
-                        img_elems = found
-                        logger.info(f"🖼️  [inst-{inst.id}] Found {len(img_elems)} image(s) via: {selector}")
-                        break
-                if not img_elems:
-                    logger.warning(f"⚠️  [inst-{inst.id}] No product images found")
 
-                # Collect unique image URLs (preserve order, skip duplicates)
-                seen_urls: set = set()
-                image_urls = []
-                for img_elem in img_elems:
-                    img_url = (
-                        _best_url_from_srcset(img_elem.get_attribute("srcset"))
-                        or _best_url_from_srcset(img_elem.get_attribute("data-srcset"))
-                        or img_elem.get_attribute("src")
-                    )
-                    if img_url and img_url.startswith("http") and img_url not in seen_urls:
-                        seen_urls.add(img_url)
-                        image_urls.append(img_url)
+            # Collect unique image URLs (preserve order, skip duplicates)
+            seen_urls: set = set()
+            image_urls = []
+            for img_elem in img_elems:
+                img_url = (
+                    _best_url_from_srcset(img_elem.get_attribute("srcset"))
+                    or _best_url_from_srcset(img_elem.get_attribute("data-srcset"))
+                    or img_elem.get_attribute("src")
+                )
+                if img_url and img_url.startswith("http") and img_url not in seen_urls:
+                    seen_urls.add(img_url)
+                    image_urls.append(img_url)
 
-                logger.info(f"🖼️  {len(image_urls)} unique image URL(s) collected")
+            logger.info(f"🖼️  {len(image_urls)} unique image URL(s) collected")
 
-                # Download images to local folder
-                downloaded_count = 0
-                for idx, img_url in enumerate(image_urls, 1):
-                    try:
-                        response = requests.get(img_url, timeout=10)
-                        if response.status_code == 200:
-                            # Detect extension from URL path; fall back to .jpg for
-                            # query-string-only URLs like cdn.autodoc.de/thumb?id=...
-                            url_path = img_url.split("?")[0]
-                            path_basename = url_path.split("/")[-1]
-                            ext = ("." + path_basename.rsplit(".", 1)[-1]) if "." in path_basename else ".jpg"
+            # Download images to local folder
+            downloaded_count = 0
+            for idx, img_url in enumerate(image_urls, 1):
+                try:
+                    response = requests.get(img_url, timeout=10)
+                    if response.status_code == 200:
+                        # Detect extension from URL path; fall back to .jpg for
+                        # query-string-only URLs like cdn.autodoc.de/thumb?id=...
+                        url_path = img_url.split("?")[0]
+                        path_basename = url_path.split("/")[-1]
+                        ext = ("." + path_basename.rsplit(".", 1)[-1]) if "." in path_basename else ".jpg"
 
-                            filename = f"{images_folder}/image_{downloaded_count + 1}{ext}"
-                            with open(filename, "wb") as f:
-                                f.write(response.content)
-                            downloaded_count += 1
-                            logger.info(f"📥 Downloaded image {downloaded_count}: {filename}")
-                        else:
-                            logger.warning(f"⚠️  Image {idx} returned HTTP {response.status_code}: {img_url[:80]}")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Failed to download image {idx}: {str(e)[:80]}")
+                        filename = f"{images_folder}/image_{downloaded_count + 1}{ext}"
+                        with open(filename, "wb") as f:
+                            f.write(response.content)
+                        downloaded_count += 1
+                        logger.info(f"📥 Downloaded image {downloaded_count}: {filename}")
+                    else:
+                        logger.warning(f"⚠️  Image {idx} returned HTTP {response.status_code}: {img_url[:80]}")
+                except Exception as e:
+                    logger.warning(f"⚠️  Failed to download image {idx}: {str(e)[:80]}")
 
-                product_data["media"]["images_downloaded"] = downloaded_count
-                logger.info(f"✅ Downloaded {downloaded_count}/{len(image_urls)} images to {images_folder}")
-            except Exception as e:
-                logger.warning(f"⚠️  Could not extract/download images: {str(e)[:100]}")
-                pass
+            product_data["media"]["images_downloaded"] = downloaded_count
+            logger.info(f"✅ Downloaded {downloaded_count}/{len(image_urls)} images to {images_folder}")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not extract/download images: {str(e)[:100]}")
+            pass
             
     except Exception as e:
         logger.error(f"❌ Error scraping product: {str(e)}")
@@ -952,16 +815,12 @@ def aggressive_popup_killer(inst: BrowserInstance):
 def safe_navigate_realoem(inst: BrowserInstance, url: str):
     """Navigate to URL and apply all protection layers for realoem"""
     inst.driver.get(url)
-    _wait_for_cloudflare(inst)
     aggressive_popup_killer(inst)
 
 
-def scrape_realoem_barcode(inst: BrowserInstance, barcode: str, timed_out: threading.Event = None) -> Dict[str, Any]:
+def scrape_realoem_barcode(inst: BrowserInstance, barcode: str) -> Dict[str, Any]:
     """Scrape BMW part data from realoem.com"""
     logger.info(f"🔍 [inst-{inst.id}] Scraping RealOEM for barcode: {barcode}")
-
-    if timed_out and timed_out.is_set():
-        return {"success": False, "error": "Scrape timed out"}
 
     numeric_barcode = re.sub(r'\D', '', str(barcode))
     if not numeric_barcode:
@@ -975,9 +834,6 @@ def scrape_realoem_barcode(inst: BrowserInstance, barcode: str, timed_out: threa
         safe_navigate_realoem(inst, url)
         time.sleep(0.5)
         aggressive_popup_killer(inst)
-
-        if timed_out and timed_out.is_set():
-            return {"success": False, "error": "Scrape timed out"}
 
         try:
             WebDriverWait(inst.driver, 10).until(
@@ -995,9 +851,6 @@ def scrape_realoem_barcode(inst: BrowserInstance, barcode: str, timed_out: threa
             except:
                 pass
 
-        if timed_out and timed_out.is_set():
-            return {"success": False, "error": "Scrape timed out"}
-
         aggressive_popup_killer(inst)
 
         try:
@@ -1006,10 +859,10 @@ def scrape_realoem_barcode(inst: BrowserInstance, barcode: str, timed_out: threa
             if "not found" in error_text.lower():
                 logger.warning(f"⚠️ [inst-{inst.id}] Part not found: {error_text}")
                 return {
-                    "product": {"part_number": "NOT FOUND", "oe_number": numeric_barcode, "description": error_text},
+                    "product": {"part_number": "NOT FOUND", "description": error_text},
                     "pricing": {"price": None},
                     "details": {"from_date": None, "to_date": None, "weight": None},
-                    "compatibility": {"vehicle_series": [], "engine_codes": []},
+                    "compatibility": {"vehicle_count": 0, "first_vehicle_tags": None},
                 }
         except:
             pass
@@ -1022,16 +875,6 @@ def scrape_realoem_barcode(inst: BrowserInstance, barcode: str, timed_out: threa
             return {"success": False, "error": "Content failed to load (timeout or popup blocking)"}
 
         logger.info(f"✅ [inst-{inst.id}] Part: {part_number} — {description}")
-
-        # Extract OE number from the link
-        oe_number = None
-        try:
-            oe_link = inst.driver.find_element(By.CSS_SELECTOR, 'a[href*="partxref?q="]')
-            oe_number = oe_link.text.strip()
-        except:
-            oe_number = numeric_barcode
-
-        logger.info(f"✅ [inst-{inst.id}] OE Number: {oe_number}")
 
         part_details = {}
         try:
@@ -1053,52 +896,27 @@ def scrape_realoem_barcode(inst: BrowserInstance, barcode: str, timed_out: threa
         except Exception as e:
             logger.warning(f"⚠️ [inst-{inst.id}] Error extracting vehicle links: {str(e)[:50]}")
 
-        print("New code running: extracting vehicle_series and engine_codes")
-
-        # Extract unique vehicle series
-        vehicle_series = []
-        for sl in vehicle_links_list:
-            text = sl['text']
-            model = text.split(' ')[0].strip()
-            if model not in vehicle_series:
-                vehicle_series.append(model)
-
-        # Collect engine codes from first 1-3 series
-        num_to_visit = min(3, len(vehicle_links_list))
-        engine_codes = set()
-        original_url = inst.driver.current_url
-        for i in range(num_to_visit):
-            if timed_out and timed_out.is_set():
-                return {"success": False, "error": "Scrape timed out"}
-            sl = vehicle_links_list[i]
-            series_url = sl['url'].split('#')[0]
+        vehicle_tags = ""
+        if vehicle_links_list:
+            first_vehicle_url = vehicle_links_list[0]["url"]
+            logger.info(f"🚗 [inst-{inst.id}] Navigating to first vehicle...")
+            safe_navigate_realoem(inst, first_vehicle_url)
+            time.sleep(0.5)
+            aggressive_popup_killer(inst)
             try:
-                safe_navigate_realoem(inst, series_url)
-                time.sleep(0.5)
-                aggressive_popup_killer(inst)
-                
-                # Extract
-                try:
-                    results_div = inst.driver.find_element(By.CSS_SELECTOR, "div.partSearchResults")
-                    lis = results_div.find_elements(By.CSS_SELECTOR, "ul li")
-                    for li in lis:
-                        raw = li.text
-                        parts = raw.split(',')
-                        if len(parts) > 3:
-                            engine = parts[3].strip()
-                            engine_codes.add(engine)
-                except Exception as e:
-                    logger.warning(f"  ⚠️  Engine codes error: {str(e)[:60]}")
+                results_section = WebDriverWait(inst.driver, 10).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "partSearchResults"))
+                )
+                first_li = results_section.find_element(By.CSS_SELECTOR, "ul li:first-child")
+                full_text = first_li.text.strip()
+                vehicle_tags = full_text.split(':')[0].strip() if ':' in full_text else full_text
+                logger.info(f"✅ [inst-{inst.id}] Vehicle tags: {vehicle_tags}")
             except Exception as e:
-                logger.warning(f"  ⚠️  Navigation error: {str(e)[:60]}")
-
-        # Return to original page
-        safe_navigate_realoem(inst, original_url)
-        time.sleep(0.5)
-        aggressive_popup_killer(inst)
+                logger.warning(f"⚠️ [inst-{inst.id}] Error extracting vehicle tags: {str(e)[:50]}")
+                vehicle_tags = "N/A"
 
         return {
-            "product": {"part_number": part_number, "oe_number": oe_number, "description": description},
+            "product": {"part_number": part_number, "description": description},
             "pricing": {"price": part_details.get("Price") or None},
             "details": {
                 "from_date": part_details.get("From") or None,
@@ -1106,8 +924,8 @@ def scrape_realoem_barcode(inst: BrowserInstance, barcode: str, timed_out: threa
                 "weight": part_details.get("Weight") or None,
             },
             "compatibility": {
-                "vehicle_series": vehicle_series,
-                "engine_codes": list(engine_codes),
+                "vehicle_count": len(vehicle_links_list),
+                "first_vehicle_tags": vehicle_tags or None,
             },
         }
 
@@ -1194,27 +1012,32 @@ def scrape_barcode(request: BarcodeRequest):
     logger.info(f"🎯 Request: barcode={barcode} scraper={scraper.upper()}")
     timeout = REALOEM_TIMEOUT if scraper == "realoem" else AUTODOC_TIMEOUT
 
-    # Acquire a browser instance (waits up to timeout s for one to become free)
+    # Acquire a browser instance (waits up to 30 s for one to become free)
     try:
-        inst = pool.acquire(timeout=timeout)
+        inst = pool.acquire(timeout=30)
     except RuntimeError:
         logger.warning(f"⚠️  All {POOL_MAX_INSTANCES} browser instances busy — rejecting {barcode}")
         raise HTTPException(status_code=503, detail="All scrapers busy, please retry in a moment")
 
-    # Watchdog timer — sets a flag if the scrape exceeds the timeout.
-    # The main thread will check this flag and abort gracefully.
+    # Watchdog timer — kills the driver if the scrape exceeds the timeout.
+    # This avoids the old two-thread race where the executor thread was
+    # still using the driver while the main thread called revive().
     timed_out = threading.Event()
 
     def _watchdog():
         timed_out.set()
-        logger.error(f"⏱️  [inst-{inst.id}] Scrape timed out after {timeout}s")
+        logger.error(f"⏱️  [inst-{inst.id}] Scrape timed out after {timeout}s — killing driver")
+        inst.quit()
 
     timer = threading.Timer(timeout, _watchdog)
     timer.start()
     try:
-        result = _run_scrape(inst, barcode, scraper, timed_out)
+        result = _run_scrape(inst, barcode, scraper)
         timer.cancel()
-        if timed_out.is_set():
+        # If _run_scrape returned an error AND the watchdog caused it, give
+        # a clearer timeout message.  If it returned success, keep the result
+        # even if the watchdog fired a split-second later.
+        if not result.success and timed_out.is_set():
             return ProductResponse(success=False, barcode=barcode, scraper=scraper,
                                    error=f"Scrape timed out after {timeout}s")
         return result
@@ -1230,15 +1053,11 @@ def scrape_barcode(request: BarcodeRequest):
         pool.release(inst)
 
 
-def _run_scrape(inst: BrowserInstance, barcode: str, scraper: str, timed_out: threading.Event = None) -> ProductResponse:
+def _run_scrape(inst: BrowserInstance, barcode: str, scraper: str) -> ProductResponse:
     """Core scrape logic — runs in the same thread as scrape_barcode()."""
     try:
-        if timed_out and timed_out.is_set():
-            return ProductResponse(success=False, barcode=barcode, scraper=scraper,
-                                   error=f"Scrape timed out")
-
         if scraper == "realoem":
-            result = scrape_realoem_barcode(inst, barcode, timed_out)
+            result = scrape_realoem_barcode(inst, barcode)
             if result.get("success") == False or result.get("error"):
                 return ProductResponse(success=False, barcode=barcode, scraper=scraper,
                                        error=result.get("error", "Failed to scrape RealOEM"))
@@ -1246,9 +1065,6 @@ def _run_scrape(inst: BrowserInstance, barcode: str, scraper: str, timed_out: th
             return ProductResponse(success=True, barcode=barcode, scraper=scraper, data=result)
 
         else:  # autodoc
-            if timed_out and timed_out.is_set():
-                return ProductResponse(success=False, barcode=barcode, scraper=scraper,
-                                       error=f"Scrape timed out")
             inst.warmup_autodoc()  # no-op if already done
 
             url = f"https://www.autodoc.co.uk/spares-search?keyword={barcode}"
@@ -1259,17 +1075,13 @@ def _run_scrape(inst: BrowserInstance, barcode: str, scraper: str, timed_out: th
             _handle_cookies(inst)
             time.sleep(3)
 
-            if timed_out and timed_out.is_set():
-                return ProductResponse(success=False, barcode=barcode, scraper=scraper,
-                                       error=f"Scrape timed out")
-
             product_link = get_first_product_link(inst, barcode)
             if not product_link:
                 return ProductResponse(success=False, barcode=barcode, scraper=scraper,
                                        error="No product found for this barcode")
 
             logger.info(f"✅ [inst-{inst.id}] Product link: {product_link}")
-            product_data = scrape_product_details(inst, product_link, barcode, timed_out)
+            product_data = scrape_product_details(inst, product_link, barcode)
             logger.info(f"✅ [inst-{inst.id}] Autodoc scrape complete")
             return ProductResponse(success=True, barcode=barcode, scraper=scraper, data=product_data)
 
@@ -1292,4 +1104,4 @@ def scrape_barcode_get(barcode: str, scraper: str = "autodoc"):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8010)
